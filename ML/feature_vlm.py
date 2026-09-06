@@ -7,7 +7,7 @@ import socketserver
 import threading
 
 import ollama
-from PIL import Image, ImageDraw
+from PIL import Image
 from pathlib import Path
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
@@ -21,18 +21,6 @@ NUM_TILES = 3
 TILE_OVERLAP = 100
 SEVERITY_RANK = {"Minor": 1, "Major": 2, "Critical": 3}
 VOTE_ATTEMPTS = 3
-
-# NEW: threshold below which a selector is considered too unreliable to
-# auto-apply, even if the bug itself was detected with high confidence.
-SELECTOR_CONFIDENCE_THRESHOLD = 0.6
-
-# NEW: colors for the severity heatmap overlay (RGBA)
-SEVERITY_COLOR = {
-    "Critical": (255, 0, 0, 90),
-    "Major": (255, 140, 0, 90),
-    "Minor": (255, 220, 0, 90),
-}
-HEATMAP_OUTPUT_DIR = "ML/heatmaps"
 
 HTML_PATH = "screenshots/broken/broken-button-clip/assets/broken-button-clip.html"
 AFTER_SCREENSHOT_PATH = "ML/images/after-fix.png"
@@ -64,7 +52,6 @@ REQUIRED_FIELDS = [
     "description",
     "severity_level",
     "confidence_score",
-    "bbox",
     "fix",
 ]
 
@@ -152,30 +139,15 @@ RULES:
      Choose based on real impact. Do not default to one value.
    - "confidence_score" MUST reflect how clearly you can see the defect.
      Use a value between 0.0 and 1.0. Do not always return the same number.
-   - "bbox" MUST locate the defective element WITHIN THIS CROPPED IMAGE,
-     as normalized coordinates between 0.0 and 1.0 (0,0 = top-left of
-     THIS cropped image, 1,1 = bottom-right of THIS cropped image):
-     {{
-       "x_min": <0.0-1.0>, "y_min": <0.0-1.0>,
-       "x_max": <0.0-1.0>, "y_max": <0.0-1.0>
-     }}
-     x_max MUST be greater than x_min, y_max MUST be greater than y_min.
-     Draw this box tightly around the defective element only.
    - "fix" MUST be a JSON object (not a sentence) with this exact shape,
      kept SHORT - the selector must be at most 6 parts long:
      {{
        "selector": "<short selector, max 6 space-separated parts>",
-       "selector_confidence": <0.0-1.0>,
        "css_changes": [
          {{"property": "<a real CSS property name>", "value": "<a valid CSS value>"}}
        ],
        "explanation": "<one short sentence of why this fixes it>"
      }}
-   - "selector_confidence" is SEPARATE from "confidence_score" above. It
-     reflects ONLY how sure you are that the selector you chose points to
-     the exact broken element in the HTML - not how sure you are that a
-     bug exists. Give it a low value (< 0.5) if you are guessing, if the
-     class name is ambiguous, or if multiple elements could match.
 3. SELECTOR RULES (strict):
    - The selector MUST match an element that actually exists in the HTML above.
    - The selector MUST be SHORT: at most 6 space-separated parts. Never
@@ -197,8 +169,7 @@ RULES:
    - If the class in the HTML above is NOT repeated, use that class
      directly - do NOT add a positional pseudo-class when not needed.
    - If the HTML is not available, or you cannot find the element in it,
-     set "selector" to null, "selector_confidence" to 0.0, and
-     "css_changes" to [].
+     set "selector" to null and "css_changes" to [].
 4. The fix must REDUCE the defect. If an element is clipped or cut off,
    do not shrink it. Only include properties that directly address the
    defect (width, max-width, overflow, white-space, display, position).
@@ -209,8 +180,7 @@ RULES:
    LARGE and overlapping other elements (opposite case).
 5. If no visible defects: "bug_found": false, "severity_level": null,
    "description": "No visible UI bug was detected.",
-   "bbox": null,
-   "fix": {{"selector": null, "selector_confidence": 0.0, "css_changes": [], "explanation": "No fix required."}}
+   "fix": {{"selector": null, "css_changes": [], "explanation": "No fix required."}}
 
 Return ONLY raw JSON. No markdown, no backticks, no commentary.
 Schema (types only - do not copy these placeholder values):
@@ -219,10 +189,8 @@ Schema (types only - do not copy these placeholder values):
   "description": "<string>",
   "severity_level": "<Critical|Major|Minor or null>",
   "confidence_score": <number between 0.0 and 1.0>,
-  "bbox": {{"x_min": <number>, "y_min": <number>, "x_max": <number>, "y_max": <number>}} or null,
   "fix": {{
     "selector": "<string or null>",
-    "selector_confidence": <number between 0.0 and 1.0>,
     "css_changes": [
       {{"property": "<string>", "value": "<string>"}}
     ],
@@ -288,28 +256,6 @@ def clean_json_text(raw_output):
 # -------------------------------------------------
 # Schema Validation
 # -------------------------------------------------
-def validate_bbox(bbox):
-    if bbox is None:
-        return None
-    if not isinstance(bbox, dict):
-        return False
-    keys = ("x_min", "y_min", "x_max", "y_max")
-    if any(k not in bbox for k in keys):
-        return False
-    try:
-        for k in keys:
-            bbox[k] = float(bbox[k])
-    except (ValueError, TypeError):
-        return False
-    if not (0.0 <= bbox["x_min"] <= 1.0 and 0.0 <= bbox["x_max"] <= 1.0):
-        return False
-    if not (0.0 <= bbox["y_min"] <= 1.0 and 0.0 <= bbox["y_max"] <= 1.0):
-        return False
-    if bbox["x_max"] <= bbox["x_min"] or bbox["y_max"] <= bbox["y_min"]:
-        return False
-    return True
-
-
 def validate_result(result):
     missing = [f for f in REQUIRED_FIELDS if f not in result]
     if missing:
@@ -339,27 +285,8 @@ def validate_result(result):
             print("   ❌ Invalid severity_level (need Critical/Major/Minor)")
             return None
 
-        bbox_status = validate_bbox(result.get("bbox"))
-        if bbox_status is False:
-            print("   ❌ Invalid bbox (must be x_min<x_max, y_min<y_max, all in 0.0-1.0)")
-            return None
-        if bbox_status is None:
-            print("   ⚠️  Bug reported but no bbox given - heatmap overlay will be skipped")
-
         selector = fix.get("selector")
         changes = fix.get("css_changes")
-
-        if "selector_confidence" not in fix:
-            print("   ❌ fix.selector_confidence is required")
-            return None
-        try:
-            fix["selector_confidence"] = float(fix["selector_confidence"])
-        except (ValueError, TypeError):
-            print("   ❌ Invalid fix.selector_confidence")
-            return None
-        if not 0.0 <= fix["selector_confidence"] <= 1.0:
-            print("   ❌ fix.selector_confidence must be between 0.0 and 1.0")
-            return None
 
         if selector is None:
             if changes not in ([], None):
@@ -387,13 +314,9 @@ def validate_result(result):
         if result["severity_level"] is not None:
             print("   ❌ severity_level must be null when bug_found is false")
             return None
-        if result.get("bbox") is not None:
-            print("   ❌ bbox must be null when bug_found is false")
-            return None
         if fix.get("selector") is not None or fix.get("css_changes") != []:
             print("   ❌ fix must be null/empty when bug_found is false")
             return None
-        fix.setdefault("selector_confidence", 0.0)
 
     try:
         result["confidence_score"] = float(result["confidence_score"])
@@ -406,79 +329,6 @@ def validate_result(result):
         return None
 
     return result
-
-
-# -------------------------------------------------
-# Selector confidence gate (PR flagging)
-# -------------------------------------------------
-def check_selector_confidence(fix, threshold=SELECTOR_CONFIDENCE_THRESHOLD):
-    """
-    Returns (should_flag_for_review: bool, reason: str).
-    This is intentionally independent of bug confidence_score - a bug can
-    be detected with very high visual confidence while the selector that
-    identifies WHERE to fix it is still a low-confidence guess.
-    """
-    if not fix.get("selector"):
-        return True, "No selector available - cannot auto-apply, needs manual review."
-
-    sel_conf = fix.get("selector_confidence", 0.0)
-    if sel_conf < threshold:
-        return True, (
-            f"Selector confidence ({sel_conf:.2f}) is below threshold "
-            f"({threshold}) - flagging for manual review even though the "
-            f"bug itself may be high-confidence."
-        )
-    return False, ""
-
-
-# -------------------------------------------------
-# Bug-severity heatmap overlay
-# -------------------------------------------------
-def draw_bug_heatmap(img_path, bbox, severity_level, output_path, crop_region=CROP_REGION):
-    """
-    bbox is normalized (0.0-1.0) relative to the CROPPED image that was
-    actually sent to the VLM. This maps it back onto the full-resolution
-    original screenshot and draws a translucent severity-colored box.
-    """
-    if bbox is None:
-        print("   ⚠️  No bbox available - skipping heatmap overlay")
-        return None
-
-    color = SEVERITY_COLOR.get(severity_level, (255, 0, 0, 90))
-
-    with Image.open(img_path) as im:
-        im = im.convert("RGBA")
-        width, height = im.size
-
-        crop_left = crop_region["left"] * width
-        crop_top = crop_region["top"] * height
-        crop_right = crop_region["right"] * width
-        crop_bottom = crop_region["bottom"] * height
-        crop_w = crop_right - crop_left
-        crop_h = crop_bottom - crop_top
-
-        abs_x_min = crop_left + bbox["x_min"] * crop_w
-        abs_y_min = crop_top + bbox["y_min"] * crop_h
-        abs_x_max = crop_left + bbox["x_max"] * crop_w
-        abs_y_max = crop_top + bbox["y_max"] * crop_h
-
-        overlay = Image.new("RGBA", im.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(overlay)
-        draw.rectangle(
-            [abs_x_min, abs_y_min, abs_x_max, abs_y_max],
-            fill=color,
-            outline=(color[0], color[1], color[2], 255),
-            width=3,
-        )
-        label = severity_level or "Bug"
-        draw.text((abs_x_min + 4, max(0, abs_y_min - 18)), label, fill=(255, 255, 255, 255))
-
-        combined = Image.alpha_composite(im, overlay).convert("RGB")
-
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-        combined.save(output_path)
-        print(f"   ✅ Heatmap overlay saved: {output_path}")
-        return output_path
 
 
 # -------------------------------------------------
@@ -518,7 +368,7 @@ def apply_css_fix(html_path, fix):
 
 
 # -------------------------------------------------
-# Screenshot HTML — NOW VALIDATES THE PAGE ACTUALLY LOADED
+# Screenshot HTML
 # -------------------------------------------------
 def screenshot_html(html_path, screenshot_path):
     html_path = Path(html_path).resolve()
@@ -542,21 +392,7 @@ def screenshot_html(html_path, screenshot_path):
             page.on("console", lambda msg: print(f"   CONSOLE: {msg.text}"))
             page.on("pageerror", lambda err: print(f"   PAGE ERROR: {err}"))
             page.on("requestfailed", lambda req: print(f"   REQUEST FAILED: {req.url} - {req.failure}"))
-
-            response = page.goto(f"http://localhost:{port}/{html_path.name}")
-
-            # Fail loudly instead of silently screenshotting an error page.
-            # This is what caught the bug where the heatmap was being drawn
-            # on a "404 File not found" page instead of the real UI.
-            if response is None or response.status != 200:
-                status = response.status if response else "no response"
-                browser.close()
-                raise RuntimeError(
-                    f"Page failed to load (HTTP {status}) — "
-                    f"refusing to screenshot an error page. "
-                    f"Check that {html_path.name} exists in {serve_dir}."
-                )
-
+            page.goto(f"http://localhost:{port}/{html_path.name}")
             page.wait_for_timeout(5000)
             page.screenshot(path=str(screenshot_path), full_page=False)
             browser.close()
@@ -769,8 +605,7 @@ def merge_results(tile_results):
             "description": "No visible UI bug was detected in this screenshot.",
             "severity_level": None,
             "confidence_score": lowest["confidence_score"],
-            "bbox": None,
-            "fix": {"selector": None, "selector_confidence": 0.0, "css_changes": [], "explanation": "No fix required."},
+            "fix": {"selector": None, "css_changes": [], "explanation": "No fix required."},
         }
 
     actionable = [b for b in bugs if b["fix"].get("selector")]
@@ -786,7 +621,6 @@ def merge_results(tile_results):
         "description": worst["description"],
         "severity_level": worst["severity_level"],
         "confidence_score": worst["confidence_score"],
-        "bbox": worst.get("bbox"),
         "fix": worst["fix"],
     }
 
@@ -867,20 +701,6 @@ if __name__ == "__main__":
 
             if final["bug_found"]:
                 print("\n🔴 BUG DETECTED")
-
-                heatmap_name = Path(img).stem + "_heatmap.png"
-                draw_bug_heatmap(
-                    img,
-                    final.get("bbox"),
-                    final["severity_level"],
-                    os.path.join(HEATMAP_OUTPUT_DIR, heatmap_name),
-                )
-
-                needs_review, reason = check_selector_confidence(final["fix"])
-                if needs_review:
-                    print(f"   🚩 PR FLAG (selector confidence): {reason}")
-                else:
-                    print(f"   ✅ Selector confidence OK ({final['fix']['selector_confidence']:.2f}) - safe to auto-apply")
             else:
                 print("\n🟢 NO BUG DETECTED")
 
@@ -912,82 +732,66 @@ if __name__ == "__main__":
         else:
             fix = detection["fix"]
 
-            needs_review, review_reason = check_selector_confidence(fix)
-            if needs_review:
-                print(f"⚠️  Selector confidence too low to auto-apply: {review_reason}")
+            print("\n1. Applying fix:")
+            print(json.dumps(fix, indent=2))
+
+            is_valid, reason = sanity_check_selector(fix)
+
+            if not is_valid:
+                print(f"⚠️  Selector rejected before apply: {reason}")
                 log_self_healing_result({
                     "html_path": HTML_PATH,
                     "original_bug": detection["description"],
                     "fix_applied": fix,
-                    "status": "LOW_SELECTOR_CONFIDENCE",
+                    "status": "BAD_SELECTOR",
                     "evaluation": None,
-                    "pr_flag_reason": review_reason,
+                    "error": reason,
                 })
                 print("\n==============================")
-                print("SELF-HEALING RESULT: LOW_SELECTOR_CONFIDENCE (flagged for review)")
+                print("SELF-HEALING RESULT: BAD_SELECTOR")
                 print("==============================")
 
             else:
-                print("\n1. Applying fix:")
-                print(json.dumps(fix, indent=2))
+                try:
+                    apply_css_fix(HTML_PATH, fix)
 
-                is_valid, reason = sanity_check_selector(fix)
+                    print("\n2. Taking after-fix screenshot...")
+                    screenshot_html(HTML_PATH, AFTER_SCREENSHOT_PATH)
 
-                if not is_valid:
-                    print(f"⚠️  Selector rejected before apply: {reason}")
+                    print("\n3. Evaluating fixed screenshot...")
+                    evaluation = evaluate_fixed_screenshot(
+                        AFTER_SCREENSHOT_PATH,
+                        detection["description"],
+                    )
+                    evaluation = sanity_check_evaluation(evaluation)
+                    print(json.dumps(evaluation, indent=2))
+
+                    status = "NOT_FIXED" if evaluation.get("bug_still_present") else "FIXED"
+
                     log_self_healing_result({
                         "html_path": HTML_PATH,
                         "original_bug": detection["description"],
                         "fix_applied": fix,
-                        "status": "BAD_SELECTOR",
-                        "evaluation": None,
-                        "error": reason,
+                        "status": status,
+                        "evaluation": evaluation,
                     })
+
                     print("\n==============================")
-                    print("SELF-HEALING RESULT: BAD_SELECTOR")
+                    print(f"SELF-HEALING RESULT: {status}")
                     print("==============================")
 
-                else:
-                    try:
-                        apply_css_fix(HTML_PATH, fix)
+                except Exception as e:
+                    print(f"❌ Self-healing error: {e}")
 
-                        print("\n2. Taking after-fix screenshot...")
-                        screenshot_html(HTML_PATH, AFTER_SCREENSHOT_PATH)
+                    log_self_healing_result({
+                        "html_path": HTML_PATH,
+                        "original_bug": detection["description"],
+                        "fix_applied": fix,
+                        "status": "APPLY_FAILED",
+                        "evaluation": None,
+                        "error": str(e),
+                    })
 
-                        print("\n3. Evaluating fixed screenshot...")
-                        evaluation = evaluate_fixed_screenshot(
-                            AFTER_SCREENSHOT_PATH,
-                            detection["description"],
-                        )
-                        evaluation = sanity_check_evaluation(evaluation)
-                        print(json.dumps(evaluation, indent=2))
-
-                        status = "NOT_FIXED" if evaluation.get("bug_still_present") else "FIXED"
-
-                        log_self_healing_result({
-                            "html_path": HTML_PATH,
-                            "original_bug": detection["description"],
-                            "fix_applied": fix,
-                            "status": status,
-                            "evaluation": evaluation,
-                        })
-
-                        print("\n==============================")
-                        print(f"SELF-HEALING RESULT: {status}")
-                        print("==============================")
-
-                    except Exception as e:
-                        print(f"❌ Self-healing error: {e}")
-
-                        log_self_healing_result({
-                            "html_path": HTML_PATH,
-                            "original_bug": detection["description"],
-                            "fix_applied": fix,
-                            "status": "APPLY_FAILED",
-                            "evaluation": None,
-                            "error": str(e),
-                        })
-
-                        print("\n==============================")
-                        print("SELF-HEALING RESULT: APPLY_FAILED")
-                        print("==============================")
+                    print("\n==============================")
+                    print("SELF-HEALING RESULT: APPLY_FAILED")
+                    print("==============================")

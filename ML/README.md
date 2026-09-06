@@ -618,4 +618,4 @@ This is why the pipeline treats no single VLM call as authoritative — every la
 ### Week 4 — Image Cropping Optimization
 * Validated image cropping logic across **2 consecutive runs**
 * Achieved **3/3 detection consistency** on the target bug scenario
-* Status: ✅ Stable / Validated
+* Status: ✅ Stable / Validate
